@@ -2,90 +2,30 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
 
 import streamlit as st
-from supabase import create_client, Client
 
-
-@dataclass(frozen=True)
-class Settings:
-    supabase_url: str
-    supabase_anon_key: str
-
-    @staticmethod
-    def load() -> "Settings":
-        supa = st.secrets.get("supabase", {})
-        return Settings(
-            supabase_url=supa.get("url") or os.environ["SUPABASE_URL"],
-            supabase_anon_key=supa.get("anon_key") or os.environ["SUPABASE_ANON_KEY"],
-        )
-
-
-@st.cache_resource
-def get_supabase(settings: Settings) -> Client:
-    return create_client(settings.supabase_url, settings.supabase_anon_key)
-
-
-def fetch_documents(supabase: Client, limit: int = 2000) -> List[Dict[str, Any]]:
-    res = (
-        supabase.table("cao_documents")
-        .select("cao_id,cao_name,source_url,storage_bucket,storage_path,file_sha256,file_bytes,processed_at,ingested_at")
-        .order("cao_name")
-        .limit(limit)
-        .execute()
-    )
-    return res.data or []
-
-
-def fetch_chunk_count(supabase: Client, cao_id: str) -> int:
-    res = (
-        supabase.table("cao_chunks")
-        .select("chunk_id", count="exact")
-        .eq("cao_id", cao_id)
-        .limit(1)
-        .execute()
-    )
-    return int(res.count or 0)
-
-
-def try_get_pdf_url(supabase: Client, bucket: str, path: str) -> Optional[str]:
-    storage = supabase.storage.from_(bucket)
-
-    try:
-        pub = storage.get_public_url(path)
-        if isinstance(pub, dict):
-            url = pub.get("publicUrl") or pub.get("data", {}).get("publicUrl")
-            if url:
-                return url
-        if isinstance(pub, str):
-            return pub
-    except Exception:
-        pass
-
-    try:
-        signed = storage.create_signed_url(path, 60 * 60)
-        if isinstance(signed, dict):
-            url = signed.get("signedUrl") or signed.get("data", {}).get("signedUrl")
-            if url:
-                return url
-        if isinstance(signed, str):
-            return signed
-    except Exception:
-        pass
-
-    return None
-
+from clients.supabase_client import get_supabase_client
+from core.errors import MissingConfigError
+from core.settings import load_etl_settings, load_settings, require_etl_settings, require_supabase
+from services.documents_service import DocumentsService
+from services.etl_service import EtlService
 
 def run_documents_page() -> None:
-    settings = Settings.load()
-    supabase = get_supabase(settings)
+    try:
+        settings = load_settings(st.secrets, os.environ)
+        require_supabase(settings.supabase)
+    except MissingConfigError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    supabase = get_supabase_client(settings.supabase)
+    service = DocumentsService(supabase)
 
     st.title("Documents")
     st.caption("Overzicht van CAO-PDF’s in Supabase + verwerkingsstatus + chunks.")
 
-    docs = fetch_documents(supabase)
+    docs = service.list_documents()
     if not docs:
         st.info("Geen documenten gevonden.")
         st.stop()
@@ -124,27 +64,18 @@ def run_documents_page() -> None:
     bucket = selected.get("storage_bucket")
     path = selected.get("storage_path")
     if bucket and path:
-        url = try_get_pdf_url(supabase, bucket, path)
+        url = service.get_pdf_url(bucket, path)
         if url:
             st.link_button("Open PDF", url)
         else:
             st.info("Geen (public/signed) URL beschikbaar met huidige credentials/policies.")
 
     st.subheader("Chunks")
-    cnt = fetch_chunk_count(supabase, cao_id)
+    cnt = service.chunk_count(cao_id)
     st.write({"chunk_count": cnt})
 
     preview_n = st.slider("Preview chunks", min_value=3, max_value=30, value=10, step=1)
-    rows = (
-        supabase.table("cao_chunks")
-        .select("chunk_id,chunk_index,page_start,page_end,chunk_content")
-        .eq("cao_id", cao_id)
-        .order("chunk_index")
-        .limit(preview_n)
-        .execute()
-        .data
-        or []
-    )
+    rows = service.chunk_preview(cao_id, preview_n)
 
     for r in rows:
         st.markdown(
@@ -152,3 +83,44 @@ def run_documents_page() -> None:
         )
         st.write((r.get("chunk_content") or "").strip())
         st.divider()
+
+    st.subheader("ETL pipeline")
+    st.caption("Run scraping, ingest, en processing vanuit de UI (vereist service role key).")
+    etl_settings = load_etl_settings(st.secrets, os.environ)
+    try:
+        require_etl_settings(etl_settings)
+    except MissingConfigError as exc:
+        st.info(str(exc))
+        st.stop()
+
+    etl_service = EtlService(EtlService.repo_root_from_here())
+    script_paths = {
+        "Scrape FNV PDFs": "etl-pipeline-fnv/scripts/scraping.py",
+        "Ingest naar Supabase": "etl-pipeline-fnv/scripts/ingest_to_supabase.py",
+        "Process (chunks + embeddings)": "etl-pipeline-fnv/scripts/main.py",
+    }
+
+    if "etl_output" not in st.session_state:
+        st.session_state["etl_output"] = ""
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Run scraping"):
+            with st.spinner("Scraping..."):
+                res = etl_service.run_script(script_paths["Scrape FNV PDFs"], [], settings=etl_settings)
+            st.session_state["etl_output"] = res.output or f"Exit code: {res.returncode}"
+    with col2:
+        if st.button("Run ingest"):
+            with st.spinner("Ingest..."):
+                res = etl_service.run_script(script_paths["Ingest naar Supabase"], [], settings=etl_settings)
+            st.session_state["etl_output"] = res.output or f"Exit code: {res.returncode}"
+    with col3:
+        if st.button("Run processing"):
+            with st.spinner("Processing..."):
+                res = etl_service.run_script(script_paths["Process (chunks + embeddings)"], ["--only-unprocessed"], settings=etl_settings)
+            st.session_state["etl_output"] = res.output or f"Exit code: {res.returncode}"
+
+    st.text_area("ETL output", st.session_state["etl_output"], height=200)
+
+
+run_documents_page()

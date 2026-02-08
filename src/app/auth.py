@@ -18,8 +18,11 @@ def require_password(app_title: str = "CAO App") -> None:
     """
     pwd = st.secrets.get("auth", {}).get("password")
     if not pwd:
-        # Misconfigured secrets: do not expose app.
-        st.stop()
+        st.warning(
+            "Geen auth wachtwoord gevonden in Streamlit secrets. "
+            "Auth is uitgeschakeld; voeg [auth].password toe om dit te activeren."
+        )
+        return
 
     if st.session_state.get("authed") is True:
         return

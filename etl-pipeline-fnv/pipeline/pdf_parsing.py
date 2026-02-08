@@ -1,5 +1,11 @@
 # ----------------------------- pdf parsing -----------------------------
 
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+import fitz  # PyMuPDF
+
 def extract_text_with_page_map(pdf_bytes: bytes) -> Tuple[str, List[Tuple[int, int, int]]]:
     """
     Returns:

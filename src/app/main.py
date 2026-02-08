@@ -15,7 +15,8 @@ def run_main() -> None:
     Expected structure:
       - main.py (this file)
       - pages/1_Search.py, pages/2_RAG.py, pages/3_Documents.py
-      - auth.py, state.py, ui_components.py, search.py, rag.py, documents.py
+      - auth.py, state.py, ui_components.py
+      - core/, clients/, services/ for configuration and business logic
     """
     st.set_page_config(
         page_title="CAO Semantic Search",

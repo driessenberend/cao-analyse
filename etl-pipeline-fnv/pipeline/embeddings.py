@@ -1,5 +1,15 @@
 # ----------------------------- openai embeddings -----------------------------
 
+from __future__ import annotations
+
+import logging
+import time
+from typing import List
+
+from openai import OpenAI
+
+log = logging.getLogger("embeddings")
+
 def embed_texts(client: OpenAI, model: str, texts: List[str]) -> List[List[float]]:
     """
     Embeds a batch of texts. Includes minimal retry logic.

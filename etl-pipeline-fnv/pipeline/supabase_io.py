@@ -1,5 +1,11 @@
 # ----------------------------- supabase I/O -----------------------------
 
+from __future__ import annotations
+
+from typing import List
+
+from supabase import Client
+
 def download_pdf_from_storage(supabase: Client, bucket: str, path: str) -> bytes:
     storage = supabase.storage.from_(bucket)
     data = storage.download(path)

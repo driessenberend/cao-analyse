@@ -22,13 +22,18 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import time
-from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from pathlib import Path
 
-import fitz  # PyMuPDF
 from openai import OpenAI
-from supabase import create_client, Client
+from supabase import create_client
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys  # noqa: E402
+
+sys.path.append(str(ROOT))
+
+from pipeline.config import OpenAISettings, ProcessingSettings, SupabaseSettings  # noqa: E402
+from pipeline.processing import process_documents  # noqa: E402
 
 
 # ----------------------------- logging -----------------------------
@@ -45,110 +50,6 @@ log = logging.getLogger("process_pdfs")
 
 # ----------------------------- config -----------------------------
 
-@dataclass(frozen=True)
-class Settings:
-    supabase_url: str
-    supabase_service_role_key: str
-    openai_api_key: str
-    embed_model: str
-    embed_dim: int
-    chunk_chars: int
-    embed_batch: int
-    upsert_batch: int
-    sleep_s: float
-
-    @staticmethod
-    def from_env(
-        *,
-        embed_model: str,
-        embed_dim: int,
-        chunk_chars: int,
-        embed_batch: int,
-        upsert_batch: int,
-        sleep_s: float,
-    ) -> "Settings":
-        return Settings(
-            supabase_url=os.environ["SUPABASE_URL"],
-            supabase_service_role_key=os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-            openai_api_key=os.environ["OPENAI_API_KEY"],
-            embed_model=embed_model,
-            embed_dim=embed_dim,
-            chunk_chars=chunk_chars,
-            embed_batch=embed_batch,
-            upsert_batch=upsert_batch,
-            sleep_s=sleep_s,
-        )
-
-# ----------------------------- main pipeline -----------------------------
-
-def process_one_document(
-    supabase: Client,
-    openai_client: OpenAI,
-    settings: Settings,
-    doc: dict,
-) -> None:
-    cao_id = doc["cao_id"]
-    cao_name = doc.get("cao_name")
-    bucket = doc["storage_bucket"]
-    storage_path = doc["storage_path"]
-
-    log.info("Processing cao_id=%s (%s) from %s/%s", cao_id, cao_name, bucket, storage_path)
-
-    pdf_bytes = download_pdf_from_storage(supabase, bucket, storage_path)
-
-    full_text, page_spans = extract_text_with_page_map(pdf_bytes)
-    if not full_text.strip():
-        log.warning("Empty extracted text for cao_id=%s", cao_id)
-        mark_processed(supabase, cao_id)
-        return
-
-    chunk_tuples = chunk_text(full_text, settings.chunk_chars)
-    if not chunk_tuples:
-        log.warning("No chunks produced for cao_id=%s", cao_id)
-        mark_processed(supabase, cao_id)
-        return
-
-    rows: List[dict] = []
-
-    # Embed and prepare upsert rows in batches
-    for base in range(0, len(chunk_tuples), settings.embed_batch):
-        batch = chunk_tuples[base:base + settings.embed_batch]
-        texts = [t[2] for t in batch]
-        vectors = embed_texts(openai_client, settings.embed_model, texts)
-
-        for idx, ((char_start, char_end, content), vec) in enumerate(zip(batch, vectors)):
-            chunk_index = base + idx
-            chunk_id = f"{cao_id}::{chunk_index}"
-            page_start, page_end = pages_for_chunk(page_spans, char_start, char_end)
-
-            rows.append({
-                "chunk_id": chunk_id,
-                "cao_id": cao_id,
-                "chunk_index": chunk_index,
-                "chunk_content": content,
-                "embedding": vec,
-                "page_start": page_start,
-                "page_end": page_end,
-                "char_start": char_start,
-                "char_end": char_end,
-            })
-
-        # throttle to be polite to API / rate limits
-        if settings.sleep_s > 0:
-            time.sleep(settings.sleep_s)
-
-        # flush periodically to keep memory stable
-        if len(rows) >= settings.upsert_batch * 3:
-            upsert_chunks(supabase, rows, settings.upsert_batch)
-            rows.clear()
-
-    if rows:
-        upsert_chunks(supabase, rows, settings.upsert_batch)
-
-    mark_processed(supabase, cao_id)
-    log.info("Done cao_id=%s (%d chunks).", cao_id, len(chunk_tuples))
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Process Supabase-stored PDFs into chunks + OpenAI embeddings.")
     parser.add_argument("--only-unprocessed", action="store_true", help="Only process documents with processed_at is NULL")
@@ -164,7 +65,12 @@ def main() -> int:
 
     setup_logging(args.log_level)
 
-    settings = Settings.from_env(
+    supabase_settings = SupabaseSettings(
+        url=os.environ["SUPABASE_URL"],
+        service_role_key=os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+    )
+    openai_settings = OpenAISettings(api_key=os.environ["OPENAI_API_KEY"])
+    processing_settings = ProcessingSettings(
         embed_model=args.embed_model,
         embed_dim=args.embed_dim,
         chunk_chars=args.chunk_chars,
@@ -173,16 +79,16 @@ def main() -> int:
         sleep_s=args.sleep_s,
     )
 
-    supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
-    openai_client = OpenAI(api_key=settings.openai_api_key)
+    supabase = create_client(supabase_settings.url, supabase_settings.service_role_key)
+    openai_client = OpenAI(api_key=openai_settings.api_key)
 
-    docs = iter_documents_to_process(supabase, only_unprocessed=args.only_unprocessed, limit=args.limit)
-    if not docs:
-        log.info("No documents to process.")
-        return 0
-
-    for d in docs:
-        process_one_document(supabase, openai_client, settings, d)
+    process_documents(
+        supabase,
+        openai_client,
+        processing_settings,
+        only_unprocessed=args.only_unprocessed,
+        limit=args.limit,
+    )
 
     return 0
 
